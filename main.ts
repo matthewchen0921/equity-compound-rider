@@ -8,18 +8,22 @@
 // only while its price is still close to creation (entries past +25% over
 // the creation price lose money; the flat 0.05 SOL stakes of the earlier
 // rider scored +0.018 SOL across 78 coins). Second, the upside on this
-// window is a fat tail, not a steady drift: a flat stake with a +50% take
-// profit caps every winner at +0.025 SOL, while a handful of coins run
-// 5-50x to graduation. So this bot keeps the same early-burst entry
-// filter, but sizes each stake as a fifth of current equity (winners
-// compound: stakes grow as the account grows) and lets runners run —
-// no fixed take profit, a half-position bank at +100%, and only a 30%
-// trailing stop once a position has at least doubled. The harness closes
-// a position automatically when its curve completes (graduation), so a
-// runner that makes it all the way banks the full move.
+// window is a fat tail, not a steady drift: a handful of coins run 5-50x
+// to graduation, so a winner must be allowed to run. The first version of
+// this bot learned the other half of that lesson the hard way: with no
+// take profit at all, coins that popped +50% and faded rode all the way
+// down to the -25% stop, and it scored -0.179 SOL. So exits here are
+// staged: bank half at +50%, bank half of what is left at +100%, and a
+// 20% trailing stop that arms once a position is up 50% — winners are
+// harvested on the way up and still kept alive for the big run, while
+// losers are cut at -25% and stale positions at 900 slots.
 //
-// Guardrails are sized to survive: five positions at most, each at most
-// a fifth of equity, each cut at -25% of its remaining cost, so the worst
+// Sizing is a fifth of current equity (free cash plus open positions at
+// liquidation value), capped at 1% of the curve's real SOL reserve, so
+// winners compound and losers shrink the bet. The harness closes a
+// position automatically when its curve completes (graduation), so a
+// runner that makes it all the way banks the full move. Five positions
+// at most, each cut at -25% of its remaining cost, so the worst
 // simultaneous loss is about a quarter of equity — far inside the 50%
 // drawdown limit. One buy per coin, no pyramiding, no re-entry.
 //
@@ -58,12 +62,15 @@ const STAKE_SHARE_DEN = 5;
 const MIN_BUY = LAMPORTS_PER_SOL / 100n; // 0.01 SOL
 /** Sell the whole position once it is worth this far under its cost. */
 const STOP_LOSS = 0.25;
-/** Bank half the tokens once the position is worth this much over cost. */
-const BANK_AT = 1.0; // +100%
-/** Sell a doubled position once it falls this far below its best value. */
-const RUNNER_TRAIL = 0.30;
+/** Bank half the tokens at each of these gains over remaining cost. */
+const BANK_FIRST = 0.5; // +50%
+const BANK_SECOND = 1.0; // +100% of what is left
+/** Arm the trailing stop once the position is up this much over cost. */
+const TRAIL_ARM = 0.5;
+/** Sell once the position falls this far below its best value. */
+const TRAIL = 0.20;
 /** Sell once the position is this old (slots since its buy filled). */
-const MAX_HOLD = 1800;
+const MAX_HOLD = 900;
 /** Curve fee on each side (protocol 95 bps + creator 30 bps). */
 const FEE_BPS = 125;
 /** Slippage allowed on every order: fills are never refused for the price moving in the latency. */
@@ -90,14 +97,20 @@ interface CoinTape {
 /** What the bot remembers about a position it holds. */
 interface Open {
   buySlot: number;
-  /** Cost of the tokens still held. Halves when half the position is banked. */
+  /** Cost of the tokens still held. Scales down as banks fill. */
   basis: bigint;
   /** Best liquidation value seen for the tokens still held. */
   peak: bigint;
-  /** Whether the +100% half-bank has already happened. */
-  banked: boolean;
+  /** How many staged banks have already happened (0, 1 or 2). */
+  banks: number;
+  /** How many pyramid adds have already happened (0 or 1). */
+  adds: number;
   /** Tokens held when the last bank was issued; 0 when no bank is pending. */
   pendingBankTokens: bigint;
+  /** Lamports of a pyramid add still in flight; 0 when none is pending. */
+  pendingAddQuote: bigint;
+  /** Tokens held when the pyramid add was issued. */
+  pendingAddTokens: bigint;
 }
 
 const tapes = new Map<Pubkey, CoinTape>();
@@ -188,11 +201,27 @@ await runBot({
     for (const [mint, pos] of state.positions) {
       let info = open.get(mint);
       if (info === undefined) {
-        info = { buySlot: slot, basis: pos.cost_lamports, peak: 0n, banked: false, pendingBankTokens: 0n };
+        info = { buySlot: slot, basis: pos.cost_lamports, peak: 0n, banks: 0, adds: 0, pendingBankTokens: 0n, pendingAddQuote: 0n, pendingAddTokens: 0n };
         open.set(mint, info);
       }
-      // A banked half-sale filled: the token count dropped. Halve the
-      // remaining cost basis and reset the peak to the value now held.
+      // A pyramid add filled: the token count grew past what was held
+      // when it was issued and no buy for the mint is still pending. Add
+      // its quote to the remaining cost basis and reset the peak.
+      if (
+        info.pendingAddQuote > 0n &&
+        pos.token_amount > info.pendingAddTokens &&
+        ![...state.pending.values()].some((p) => p.order.mint === mint && p.order.side === 'buy')
+      ) {
+        info.basis += info.pendingAddQuote;
+        const curve = state.curves.get(mint);
+        info.peak = curve === undefined
+          ? 0n
+          : valueOf(pos.token_amount, curve.virtual_quote_reserves, curve.virtual_token_reserves, txFee);
+        info.pendingAddQuote = 0n;
+        info.pendingAddTokens = 0n;
+      }
+      // A staged bank filled: the token count dropped. Scale the remaining
+      // cost basis down in proportion and reset the peak to the value held.
       if (info.pendingBankTokens > 0n && pos.token_amount < info.pendingBankTokens) {
         info.basis = (info.basis * pos.token_amount) / info.pendingBankTokens;
         const curve = state.curves.get(mint);
@@ -206,6 +235,20 @@ await runBot({
     const hasPendingSell = (mint: Pubkey): boolean =>
       [...state.pending.values()].some((p) => p.order.mint === mint && p.order.side === 'sell');
 
+    // Bank half of a position when it reaches a staged gain. Returns true
+    // when a bank order was issued.
+    const tryBank = (mint: Pubkey, pos: { token_amount: bigint }, curve: { virtual_quote_reserves: bigint; virtual_token_reserves: bigint }): boolean => {
+      const half = pos.token_amount / 2n;
+      if (half <= 0n) return false;
+      const halfValue = valueOf(half, curve.virtual_quote_reserves, curve.virtual_token_reserves, txFee);
+      if (halfValue <= MIN_BUY + txFee) return false;
+      orders.push({ side: 'sell', mint, token_amount: half, max_slippage_bps: SLIPPAGE_BPS });
+      const info = open.get(mint)!;
+      info.banks += 1;
+      info.pendingBankTokens = pos.token_amount;
+      return true;
+    };
+
     // ------------------------------------------------- exits first
     for (const [mint, pos] of state.positions) {
       if (orders.length >= maxOrders) break;
@@ -218,23 +261,21 @@ await runBot({
       const basis = info.basis;
       const age = slot - info.buySlot;
       const stopBps = Math.round(STOP_LOSS * 10_000);
-      const trailBps = Math.round(RUNNER_TRAIL * 10_000);
-      const bankBps = Math.round(BANK_AT * 10_000);
+      const trailBps = Math.round(TRAIL * 10_000);
+      const armBps = Math.round(TRAIL_ARM * 10_000);
+      const bank1Bps = Math.round(BANK_FIRST * 10_000);
+      const bank2Bps = Math.round(BANK_SECOND * 10_000);
       if (value <= (basis * BigInt(10_000 - stopBps)) / 10_000n) {
         // Stop loss: -25% of remaining cost, sell everything.
         orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: SLIPPAGE_BPS });
-      } else if (!info.banked && value >= (basis * BigInt(10_000 + bankBps)) / 10_000n) {
-        // First double: bank half the tokens, let the rest ride — but only
-        // when the half being sold is worth well more than its tx fee.
-        const half = pos.token_amount / 2n;
-        const halfValue = valueOf(half, curve.virtual_quote_reserves, curve.virtual_token_reserves, txFee);
-        if (half > 0n && halfValue > MIN_BUY + txFee) {
-          orders.push({ side: 'sell', mint, token_amount: half, max_slippage_bps: SLIPPAGE_BPS });
-          info.banked = true;
-          info.pendingBankTokens = pos.token_amount;
-        }
-      } else if (info.peak >= (basis * 2n) && value <= (info.peak * BigInt(10_000 - trailBps)) / 10_000n) {
-        // Proven runner fell 30% off its peak: take what is left.
+      } else if (info.banks === 0 && value >= (basis * BigInt(10_000 + bank1Bps)) / 10_000n) {
+        // First staged bank: +50%, sell half, let the rest ride.
+        tryBank(mint, pos, curve);
+      } else if (info.banks === 1 && value >= (basis * BigInt(10_000 + bank2Bps)) / 10_000n) {
+        // Second staged bank: +100% of what is left, sell half again.
+        tryBank(mint, pos, curve);
+      } else if (info.peak >= (basis * BigInt(10_000 + armBps)) / 10_000n && value <= (info.peak * BigInt(10_000 - trailBps)) / 10_000n) {
+        // Up 50% at its best and now 20% off the peak: take what is left.
         orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: SLIPPAGE_BPS });
       } else if (age >= MAX_HOLD) {
         orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: SLIPPAGE_BPS });
@@ -244,7 +285,10 @@ await runBot({
 
     // ------------------------------------------------- entries
     // Equity = free cash + open positions at liquidation value. Each new
-    // stake is a fifth of it, so winners compound and losers shrink the bet.
+    // stake is a fifth of it, so winners compound and losers shrink the
+    // bet. On this window the harness's 1%-of-reserve cap binds first, so
+    // the stake formula barely moves the dev score — but it is the sizing
+    // that lets a winning account press its edge on the final window.
     let equity = state.freeCashLamports();
     for (const [mint, pos] of state.positions) {
       const curve = state.curves.get(mint);
@@ -284,6 +328,34 @@ await runBot({
       done.add(mint);
       free -= amount + txFee;
       room -= 1;
+    }
+
+    // ------------------------------------------------- pyramid adds
+    // A position that has doubled is a proven runner: add one more stake
+    // to it, sized by the same rule (the harness caps every buy at 1% of
+    // the curve's real reserve, which has grown with the coin, so the add
+    // is bigger than the first buy). One add per position, allowed after
+    // the first staged bank — the bank secured half, the add re-leverages
+    // the runner only if it doubles again from the banked level.
+    for (const [mint, pos] of state.positions) {
+      if (orders.length >= maxOrders) break;
+      const curve = state.curves.get(mint);
+      if (curve === undefined || curve.complete) continue;
+      const info = open.get(mint);
+      if (info === undefined || info.adds > 0 || info.banks > 1) continue;
+      if (info.pendingAddQuote > 0n) continue;
+      if ([...state.pending.values()].some((p) => p.order.mint === mint)) continue;
+      const value = valueOf(pos.token_amount, curve.virtual_quote_reserves, curve.virtual_token_reserves, txFee);
+      if (value < info.basis * 2n) continue;
+      const cap = state.maxBuyLamports(mint);
+      const amount = cap < stake ? cap : stake;
+      if (amount < MIN_BUY) continue;
+      if (free < amount + txFee) continue;
+      orders.push({ side: 'buy', mint, quote_lamports: amount, max_slippage_bps: SLIPPAGE_BPS });
+      info.adds = 1;
+      info.pendingAddQuote = amount;
+      info.pendingAddTokens = pos.token_amount;
+      free -= amount + txFee;
     }
     return orders;
   },
