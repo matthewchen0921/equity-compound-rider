@@ -22,7 +22,7 @@ Paper trading only — the replay uses market data, never real funds.
 
 Layout: `main.ts` holds the whole strategy; `vendor/makefun-bot.ts` is the kit's replay-v2 SDK shim, copied byte for byte from the competition kit.
 
-On the kit's 24-hour dev window (1,222 coins) the kit's own pilot bots score −0.42 SOL (sniper), −4.37 SOL (reversion) and −9.45 SOL (momentum), buy-and-hold scores −0.02 SOL while trading only 5 coins, and the earlier flat-stake early-burst rider scored +0.018 SOL across 78 coins with a 0.56% maximum drawdown. This bot's dev score is reported in the build notes; the stress test shows how much of it depends on this window's particular coins.
+On the kit's 24-hour dev window (1,222 coins) it scores +0.143 SOL net PnL across 80 coins (173 fills, 18.75% win rate, 0.95% maximum drawdown, +0.065 SOL even at 2x fees). The kit's own pilot bots score −0.42 SOL (sniper), −4.37 SOL (reversion) and −9.45 SOL (momentum) on the same window, and the earlier flat-stake early-burst rider scored +0.018 SOL. Honest caveat from the stress test: on 10 rebuilt copies of the dev window the bot's median is −0.17 SOL and 9 of 10 copies lose money — the dev score leans on this window's particular coins (its top 3 coins make 66% of the gains), so on an unseen window the expected PnL is slightly negative, with a real chance of landing positive. The entry meets every guardrail with a sub-1% drawdown either way.
 
 ---
 
